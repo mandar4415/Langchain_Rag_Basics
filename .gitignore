@@ -1,0 +1,27 @@
+# Ignore environment variables
+.env
+
+# Ignore documents folder for RAG testing
+documents/
+
+# Ignore Python dependency files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+*.egg-info/
+*.egg
+*.log
+
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Ignore virtual environments
+venv/
+.env/
+.venv/
+
+# Ignore VSCode settings
+.vscode/
