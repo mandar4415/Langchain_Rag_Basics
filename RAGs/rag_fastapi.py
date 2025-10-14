@@ -47,6 +47,8 @@ class DocumentMetadata(BaseModel):
     document_percentage: Optional[str] = None
     chunk_size_chars: Optional[str] = None
     chunk_size_words: Optional[str] = None
+    context_before: Optional[str] = None
+    context_after: Optional[str] = None
 
 class RelevantDocument(BaseModel):
     content: str
@@ -219,7 +221,9 @@ async def ask_question(request: QueryRequest):
                 end_line=str(doc.metadata.get('end_line', 'N/A')),
                 document_percentage=str(doc.metadata.get('document_percentage', 'N/A')),
                 chunk_size_chars=str(doc.metadata.get('chunk_size_chars', 'N/A')),
-                chunk_size_words=str(doc.metadata.get('chunk_size_words', 'N/A'))
+                chunk_size_words=str(doc.metadata.get('chunk_size_words', 'N/A')),
+                context_before=doc.metadata.get('context_before'),
+                context_after=doc.metadata.get('context_after')
             )
             
             response_docs.append(RelevantDocument(
