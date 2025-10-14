@@ -1,8 +1,12 @@
 import os
-from langchain_core.text_splitter import CharacterTextSplitter
+from langchain.text_splitter import CharacterTextSplitter
 from langchain_community.document_loaders import TextLoader
 from langchain_chroma import Chroma
-from langchain_openai import OpenAIEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Define the directory containing the text file and the persistent directory
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -20,11 +24,11 @@ if not os.path.exists(persistent_directory):
         )
 
     # Read the text content from the file
-    loader = TextLoader(file_path)
+    loader = TextLoader(file_path) # Load the document in memory.
     documents = loader.load()
 
     # Split the document into chunks
-    text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=50) 
+    text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=50) # Each chunk have 1000 size with no overlapping chunks.
     docs = text_splitter.split_documents(documents)
 
     # Display information about the split documents
@@ -34,9 +38,12 @@ if not os.path.exists(persistent_directory):
 
     # Create embeddings
     print("\n--- Creating embeddings ---")
-    embeddings = OpenAIEmbeddings(
-        model="text-embedding-3-small"
-    )  # Update to a valid embedding model if needed
+    # Get Gemini API key from environment
+    api_key = os.getenv("GEMINI_API_KEY")
+    embeddings = GoogleGenerativeAIEmbeddings(
+        model="models/text-embedding-004",
+        google_api_key=api_key
+    )  # Using Google Gemini embeddings for consistency with other project files
     print("\n--- Finished creating embeddings ---")
 
     # Create the vector store and persist it automatically
