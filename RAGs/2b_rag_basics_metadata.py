@@ -50,7 +50,28 @@ if not relevant_docs:
 print("\n--- Relevant Documents ---")
 for i, doc in enumerate(relevant_docs, 1):
     print(f"Document {i}:\n{doc.page_content}\n")
-    print(f"Source: {doc.metadata['source']}\n")
+    print(f"Source: {doc.metadata['source']}")
+    print(f"Chunk Index: {doc.metadata['chunk_index']}")
+    print(f"Chunk ID: {doc.metadata['chunk_id']}")
+    
+    # Show human-readable chunk boundaries
+    first_words = doc.metadata.get('first_words', 'N/A')
+    last_words = doc.metadata.get('last_words', 'N/A')
+    if first_words != 'N/A' and last_words != 'N/A':
+        print(f"Chunk Content: \"{first_words}...\" → \"...{last_words}\"")
+    
+    # Show precise technical details
+    print(f"Position: Lines {doc.metadata.get('start_line', 'N/A')}-{doc.metadata.get('end_line', 'N/A')}, "
+          f"Chars {doc.metadata.get('start_char_pos', 'N/A')}-{doc.metadata.get('end_char_pos', 'N/A')}")
+    print(f"Document Progress: {doc.metadata.get('document_percentage', 'N/A')}%")
+    print(f"Size: {doc.metadata.get('chunk_size_chars', 'N/A')} chars, {doc.metadata.get('chunk_size_words', 'N/A')} words")
+    
+    # Show context for better understanding
+    context_before = doc.metadata.get('context_before', '')
+    context_after = doc.metadata.get('context_after', '')
+    if context_before or context_after:
+        print(f"Context: \"...{context_before}\" [CHUNK] \"{context_after}...\"")
+    print()
 
 
 # combined_input = (
