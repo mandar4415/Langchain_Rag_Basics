@@ -10,12 +10,13 @@ from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from langchain_community.vectorstores import Chroma
+from langchain_postgres import PGVector
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_community.document_loaders import TextLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
+from config import Config
 import PyPDF2
 import io
 
@@ -24,15 +25,15 @@ load_dotenv()
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="RAG Question Answering API",
-    description="AI-powered question answering using Retrieval Augmented Generation",
-    version="1.0.0",
+    title="RAG Question Answering API with PostgreSQL",
+    description="AI-powered question answering using Retrieval Augmented Generation with PostgreSQL and PGVector",
+    version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
 
 # Global variables for database and models (initialized once)
-db = None
+vector_store = None
 llm = None
 embeddings = None
 
@@ -83,51 +84,78 @@ class DatabaseInfo(BaseModel):
     chunk_types: Dict[str, int]
     database_status: str
     embeddings_model: str
+    database_type: str
 
-# Initialize RAG components on startup
 @app.on_event("startup")
 async def startup_event():
-    """Initialize the RAG system components"""
-    global db, llm, embeddings
+    """Initialize the RAG system components with PostgreSQL"""
+    global vector_store, llm, embeddings
     
     try:
-        # Define paths
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        persistent_directory = os.path.join(current_dir, "db", "chroma_db_with_metadata")
+        # Validate configuration
+        is_valid, missing = Config.validate_config()
+        if not is_valid:
+            raise ValueError(f"Missing configuration: {', '.join(missing)}")
+        
+        print("🔧 Using PostgreSQL configuration:")
+        Config.print_config()
         
         # Create uploaded files directory
+        current_dir = os.path.dirname(os.path.abspath(__file__))
         uploaded_files_dir = os.path.join(current_dir, "uploaded_files")
         os.makedirs(uploaded_files_dir, exist_ok=True)
         
-        # Get API key
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY not found in environment variables")
-        
         # Initialize embeddings
         embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/text-embedding-004",
-            google_api_key=api_key
+            model=Config.EMBEDDINGS_MODEL,
+            google_api_key=Config.GEMINI_API_KEY
         )
         
-        # Load vector database
-        db = Chroma(
-            persist_directory=persistent_directory,
-            embedding_function=embeddings
+        # Initialize PostgreSQL vector store
+        vector_store = PGVector(
+            embeddings=embeddings,
+            collection_name=Config.PGVECTOR_COLLECTION_NAME,
+            connection=Config.POSTGRES_CONNECTION_STRING,
+            use_jsonb=Config.PGVECTOR_USE_JSONB,
         )
         
         # Initialize LLM
         llm = ChatGoogleGenerativeAI(
-            model="gemini-2.0-flash", 
-            google_api_key=api_key
+            model=Config.LLM_MODEL, 
+            google_api_key=Config.GEMINI_API_KEY
         )
         
-        print("✅ RAG system initialized successfully!")
+        print("✅ RAG system initialized successfully with PostgreSQL!")
         print(f"📁 Uploaded files directory: {uploaded_files_dir}")
+        print(f"🗄️ PostgreSQL database: {Config.POSTGRES_DB}")
+        print(f"📊 PGVector collection: {Config.PGVECTOR_COLLECTION_NAME}")
         
     except Exception as e:
         print(f"❌ Failed to initialize RAG system: {e}")
         raise e
+
+def clean_text_for_postgresql(text: str) -> str:
+    """Clean text to remove NULL bytes and other problematic characters for PostgreSQL"""
+    import re
+    
+    # Remove NULL bytes (0x00) which PostgreSQL cannot handle
+    text = text.replace('\x00', '')
+    
+    # Remove other problematic control characters except newlines, tabs, and carriage returns
+    cleaned_text = ""
+    for char in text:
+        # Keep printable characters, newlines, tabs, and carriage returns
+        if char.isprintable() or char in ['\n', '\t', '\r']:
+            cleaned_text += char
+        else:
+            # Replace other control characters with space
+            cleaned_text += ' '
+    
+    # Remove excessive whitespace
+    cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
+    cleaned_text = cleaned_text.strip()
+    
+    return cleaned_text
 
 def extract_text_from_pdf(file_content: bytes) -> str:
     """Extract text from PDF file"""
@@ -136,6 +164,9 @@ def extract_text_from_pdf(file_content: bytes) -> str:
         text = ""
         for page in pdf_reader.pages:
             text += page.extract_text() + "\n"
+        
+        # Clean text for PostgreSQL compatibility
+        text = clean_text_for_postgresql(text)
         return text
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error reading PDF: {str(e)}")
@@ -143,12 +174,16 @@ def extract_text_from_pdf(file_content: bytes) -> str:
 def extract_text_from_txt(file_content: bytes) -> str:
     """Extract text from TXT file"""
     try:
-        return file_content.decode('utf-8')
+        text = file_content.decode('utf-8')
     except UnicodeDecodeError:
         try:
-            return file_content.decode('latin-1')
+            text = file_content.decode('latin-1')
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Error reading text file: {str(e)}")
+    
+    # Clean text for PostgreSQL compatibility
+    text = clean_text_for_postgresql(text)
+    return text
 
 def process_uploaded_file(filename: str, file_content: bytes) -> str:
     """Process uploaded file and extract text based on file type"""
@@ -165,15 +200,15 @@ def process_uploaded_file(filename: str, file_content: bytes) -> str:
         )
 
 def check_file_exists_in_database(filename: str) -> bool:
-    """Check if a file with the same name already exists in the database"""
+    """Check if a file with the same name already exists in the PostgreSQL database"""
     try:
-        # Search for any document with this source filename
-        sample_docs = db.similarity_search("test", k=1000)
-        
-        for doc in sample_docs:
-            if doc.metadata.get('source') == filename:
-                return True
-        return False
+        # Use PostgreSQL metadata filtering to check for existing source
+        results = vector_store.similarity_search(
+            query="", 
+            k=1,
+            filter={"source": {"$eq": filename}}
+        )
+        return len(results) > 0
     except:
         return False
 
@@ -298,12 +333,12 @@ def create_chunks_with_metadata(filename: str, full_text: str) -> List[Document]
 
 def filter_and_process_documents(query: str, k: int = 15) -> List[Dict[str, Any]]:
     """
-    Filter and process documents using the exact same logic as 3_rag_one_off_question.py
+    Filter and process documents using PostgreSQL similarity search with scores
     """
-    # Use Chroma's direct similarity search with scores method to get actual similarity scores
-    result_docs_with_scores = db.similarity_search_with_score(query, k=k)
+    # Use PostgreSQL's similarity search with scores method
+    result_docs_with_scores = vector_store.similarity_search_with_score(query, k=k)
     
-    # Filter and organize the results (exact same logic as working script)
+    # Filter and organize the results (same logic as ChromaDB version)
     relevant_docs = []
     for doc, score in result_docs_with_scores:
         # Filter out extremely small chunks (likely formatting/artifacts)
@@ -318,7 +353,7 @@ def filter_and_process_documents(query: str, k: int = 15) -> List[Dict[str, Any]
         if len(chunk_text.replace(" ", "").replace("*", "").replace("-", "").replace("_", "")) < 10:
             continue
         
-        # 3. Prefer chunks from the AI/ML guide for technical queries
+        # 3. Prefer chunks from specific sources for technical queries
         source = doc.metadata.get('source', '')
         
         relevant_docs.append({"doc": doc, "score": score})
@@ -360,7 +395,7 @@ async def upload_file(file: UploadFile = File(...)):
     Upload a file (TXT or PDF) and add it to the vector database
     Includes duplicate detection and file storage
     """
-    if not db or not embeddings:
+    if not vector_store or not embeddings:
         raise HTTPException(status_code=500, detail="RAG system not properly initialized")
     
     try:
@@ -392,8 +427,10 @@ async def upload_file(file: UploadFile = File(...)):
         if file_already_existed:
             # File already exists in database - don't process or save again
             try:
-                current_docs = db.similarity_search("test", k=10000)
-                current_total = len(current_docs)
+                # Count total documents in PostgreSQL (more efficient than retrieving all)
+                sample_results = vector_store.similarity_search("", k=1)
+                # For now, we'll use a simple count - in production you'd want a proper count query
+                current_total = len(vector_store.similarity_search("", k=10000))
             except:
                 current_total = 0
             
@@ -427,8 +464,8 @@ async def upload_file(file: UploadFile = File(...)):
         
         # Get current total chunks for global indexing
         try:
-            current_docs = db.similarity_search("test", k=10000)  # Get all existing docs
-            current_total = len(current_docs)
+            # For PostgreSQL, we'll use a simple count approach
+            current_total = len(vector_store.similarity_search("", k=10000))
         except:
             current_total = 0
         
@@ -438,13 +475,12 @@ async def upload_file(file: UploadFile = File(...)):
             chunk.metadata["chunk_index"] = global_index
             chunk.metadata["chunk_id"] = f"chunk_{global_index:04d}"
         
-        # Add new chunks to existing database (preserves all existing content)
-        db.add_documents(new_chunks)
+        # Add new chunks to PostgreSQL database (preserves all existing content)
+        vector_store.add_documents(new_chunks)
         
         # Get updated total count
         try:
-            updated_docs = db.similarity_search("test", k=10000)
-            updated_total = len(updated_docs)
+            updated_total = len(vector_store.similarity_search("", k=10000))
         except:
             updated_total = current_total + len(new_chunks)
         
@@ -469,9 +505,10 @@ async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "message": "RAG API is running",
-        "database_connected": db is not None,
-        "llm_initialized": llm is not None
+        "message": "RAG API is running with PostgreSQL",
+        "database_connected": vector_store is not None,
+        "llm_initialized": llm is not None,
+        "database_type": "PostgreSQL with PGVector"
     }
 
 @app.post("/query", response_model=QueryResponse)
@@ -479,7 +516,7 @@ async def ask_question(request: QueryRequest):
     """
     Main RAG endpoint - ask a question and get an AI-generated answer
     """
-    if not db or not llm:
+    if not vector_store or not llm:
         raise HTTPException(status_code=500, detail="RAG system not properly initialized")
     
     try:
@@ -544,13 +581,13 @@ async def ask_question(request: QueryRequest):
 
 @app.get("/database/info", response_model=DatabaseInfo)
 async def get_database_info():
-    """Get information about the vector database"""
-    if not db:
+    """Get information about the PostgreSQL vector database"""
+    if not vector_store:
         raise HTTPException(status_code=500, detail="Database not initialized")
     
     try:
-        # Get all documents from database
-        all_docs = db.similarity_search("test", k=10000)  # Get all documents
+        # Get all documents from PostgreSQL database
+        all_docs = vector_store.similarity_search("", k=10000)  # Get all documents
         
         # Count total chunks
         total_chunks = len(all_docs)
@@ -574,7 +611,8 @@ async def get_database_info():
             source_files=source_files,
             chunk_types=chunk_types,
             database_status="active" if total_chunks > 0 else "empty",
-            embeddings_model="text-embedding-004"
+            embeddings_model=Config.EMBEDDINGS_MODEL,
+            database_type="PostgreSQL with PGVector"
         )
         
     except Exception as e:
@@ -619,7 +657,7 @@ async def list_uploaded_files():
 async def root():
     """Welcome message with API information"""
     return {
-        "message": "Welcome to RAG Question Answering API with File Upload & Duplicate Detection",
+        "message": "Welcome to RAG Question Answering API with PostgreSQL & PGVector",
         "docs": "/docs",
         "health": "/health",
         "query_endpoint": "/query",
@@ -627,13 +665,16 @@ async def root():
         "database_info": "/database/info",
         "uploaded_files": "/files/uploaded",
         "supported_file_types": ["PDF", "TXT"],
+        "database_type": "PostgreSQL with PGVector",
         "features": [
-            "Query documents with similarity search",
+            "Query documents with similarity search using PostgreSQL",
             "Upload new files (PDF/TXT) to expand database",
             "Duplicate file detection",
             "Physical file storage in uploaded_files directory",
             "Search across all uploaded files",
-            "Contextual responses with metadata"
+            "Contextual responses with metadata",
+            "PostgreSQL vector storage with PGVector extension",
+            "High-performance vector operations"
         ]
     }
 
