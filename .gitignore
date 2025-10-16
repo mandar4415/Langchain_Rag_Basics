@@ -25,3 +25,6 @@ venv/
 
 # Ignore VSCode settings
 .vscode/
+
+# Ignore uploaded files directory
+uploaded_files/
