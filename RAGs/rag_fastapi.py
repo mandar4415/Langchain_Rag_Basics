@@ -73,6 +73,9 @@ class UploadResponse(BaseModel):
     chunks_added: int
     total_chunks_in_database: int
     file_size_bytes: int
+    file_already_existed: bool
+    file_storage_path: str
+    file_existed_physically: bool
 
 class DatabaseInfo(BaseModel):
     total_chunks: int
@@ -91,6 +94,10 @@ async def startup_event():
         # Define paths
         current_dir = os.path.dirname(os.path.abspath(__file__))
         persistent_directory = os.path.join(current_dir, "db", "chroma_db_with_metadata")
+        
+        # Create uploaded files directory
+        uploaded_files_dir = os.path.join(current_dir, "uploaded_files")
+        os.makedirs(uploaded_files_dir, exist_ok=True)
         
         # Get API key
         api_key = os.getenv("GEMINI_API_KEY")
@@ -116,6 +123,7 @@ async def startup_event():
         )
         
         print("✅ RAG system initialized successfully!")
+        print(f"📁 Uploaded files directory: {uploaded_files_dir}")
         
     except Exception as e:
         print(f"❌ Failed to initialize RAG system: {e}")
@@ -155,6 +163,30 @@ def process_uploaded_file(filename: str, file_content: bytes) -> str:
             status_code=400, 
             detail=f"Unsupported file type: {file_extension}. Supported types: PDF, TXT"
         )
+
+def check_file_exists_in_database(filename: str) -> bool:
+    """Check if a file with the same name already exists in the database"""
+    try:
+        # Search for any document with this source filename
+        sample_docs = db.similarity_search("test", k=1000)
+        
+        for doc in sample_docs:
+            if doc.metadata.get('source') == filename:
+                return True
+        return False
+    except:
+        return False
+
+def get_file_storage_path(filename: str) -> str:
+    """Get the full path where uploaded file should be stored"""
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    uploaded_files_dir = os.path.join(current_dir, "uploaded_files")
+    return os.path.join(uploaded_files_dir, filename)
+
+def check_file_exists_physically(filename: str) -> bool:
+    """Check if a file exists physically in the uploaded_files directory"""
+    file_path = get_file_storage_path(filename)
+    return os.path.exists(file_path)
 
 def create_chunks_with_metadata(filename: str, full_text: str) -> List[Document]:
     """
@@ -326,7 +358,7 @@ def generate_answer(query: str, relevant_docs: List[Dict[str, Any]]) -> str:
 async def upload_file(file: UploadFile = File(...)):
     """
     Upload a file (TXT or PDF) and add it to the vector database
-    Preserves all existing documents and adds new chunks to the same database
+    Includes duplicate detection and file storage
     """
     if not db or not embeddings:
         raise HTTPException(status_code=500, detail="RAG system not properly initialized")
@@ -343,6 +375,10 @@ async def upload_file(file: UploadFile = File(...)):
                 detail=f"Unsupported file type: {file_extension}. Supported types: PDF, TXT"
             )
         
+        # Check if file already exists in database and physically
+        file_already_existed = check_file_exists_in_database(file.filename)
+        file_existed_physically = check_file_exists_physically(file.filename)
+        
         # Read file content
         file_content = await file.read()
         file_size = len(file_content)
@@ -350,11 +386,38 @@ async def upload_file(file: UploadFile = File(...)):
         if file_size == 0:
             raise HTTPException(status_code=400, detail="Empty file uploaded")
         
+        # Get file storage path
+        file_storage_path = get_file_storage_path(file.filename)
+        
+        if file_already_existed:
+            # File already exists in database - don't process or save again
+            try:
+                current_docs = db.similarity_search("test", k=10000)
+                current_total = len(current_docs)
+            except:
+                current_total = 0
+            
+            return UploadResponse(
+                message=f"File '{file.filename}' already exists in database. No new chunks added.",
+                filename=file.filename,
+                chunks_added=0,
+                total_chunks_in_database=current_total,
+                file_size_bytes=file_size,
+                file_already_existed=True,
+                file_storage_path=file_storage_path,
+                file_existed_physically=file_existed_physically
+            )
+        
+        # Process new file
         # Extract text from file
         full_text = process_uploaded_file(file.filename, file_content)
         
         if not full_text.strip():
             raise HTTPException(status_code=400, detail="No text content found in file")
+        
+        # Save file to storage directory (only for new files)
+        with open(file_storage_path, "wb") as f:
+            f.write(file_content)
         
         # Create chunks with metadata (same logic as existing system)
         new_chunks = create_chunks_with_metadata(file.filename, full_text)
@@ -390,7 +453,10 @@ async def upload_file(file: UploadFile = File(...)):
             filename=file.filename,
             chunks_added=len(new_chunks),
             total_chunks_in_database=updated_total,
-            file_size_bytes=file_size
+            file_size_bytes=file_size,
+            file_already_existed=False,
+            file_storage_path=file_storage_path,
+            file_existed_physically=file_existed_physically
         )
         
     except HTTPException:
@@ -514,21 +580,58 @@ async def get_database_info():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error retrieving database info: {str(e)}")
 
+@app.get("/files/uploaded")
+async def list_uploaded_files():
+    """List all files stored in the uploaded_files directory"""
+    try:
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        uploaded_files_dir = os.path.join(current_dir, "uploaded_files")
+        
+        if not os.path.exists(uploaded_files_dir):
+            return {"uploaded_files": [], "total_files": 0, "storage_directory": uploaded_files_dir}
+        
+        files = []
+        for filename in os.listdir(uploaded_files_dir):
+            file_path = os.path.join(uploaded_files_dir, filename)
+            if os.path.isfile(file_path):
+                file_stats = os.stat(file_path)
+                files.append({
+                    "filename": filename,
+                    "size_bytes": file_stats.st_size,
+                    "upload_time": file_stats.st_mtime,
+                    "file_path": file_path
+                })
+        
+        # Sort by upload time (newest first)
+        files.sort(key=lambda x: x["upload_time"], reverse=True)
+        
+        return {
+            "uploaded_files": files,
+            "total_files": len(files),
+            "storage_directory": uploaded_files_dir
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing uploaded files: {str(e)}")
+
 # Root endpoint
 @app.get("/")
 async def root():
     """Welcome message with API information"""
     return {
-        "message": "Welcome to RAG Question Answering API with File Upload",
+        "message": "Welcome to RAG Question Answering API with File Upload & Duplicate Detection",
         "docs": "/docs",
         "health": "/health",
         "query_endpoint": "/query",
         "upload_endpoint": "/upload", 
         "database_info": "/database/info",
+        "uploaded_files": "/files/uploaded",
         "supported_file_types": ["PDF", "TXT"],
         "features": [
             "Query documents with similarity search",
             "Upload new files (PDF/TXT) to expand database",
+            "Duplicate file detection",
+            "Physical file storage in uploaded_files directory",
             "Search across all uploaded files",
             "Contextual responses with metadata"
         ]
